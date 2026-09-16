@@ -92,40 +92,73 @@
 #     except Exception as error:
 #         # Do not expose provider or key details to a dashboard client.
 #         raise HTTPException(status_code=502, detail="The AI care service could not generate a recommendation.") from error
-
 import json
 
 from care_agent import care_agent
+from weather_agent import get_weather_summary
 
 
 def load_sensor_data():
-
     with open("sensor_data.json", "r") as file:
         return json.load(file)
 
 
 def main():
 
-    sensor_data = load_sensor_data()
-
-    result = care_agent(sensor_data)
-
-    print("\n🌱 GREENPULSE CARE AGENT")
+    print("\n🌱 GREENPULSE AI BACKEND")
     print("=" * 60)
 
-    print("\n📥 INPUT")
+    # ---------------------------------------------------------
+    # SENSOR
+    # ---------------------------------------------------------
+
+    sensor_data = load_sensor_data()
+
+    print("\n📥 SENSOR INPUT")
     print(json.dumps(
         sensor_data,
         indent=4
     ))
 
+    # ---------------------------------------------------------
+    # WEATHER AGENT
+    # ---------------------------------------------------------
+
+    print("\n🌦️ WEATHER AGENT")
+    print("Fetching live weather...")
+
+    weather_data = get_weather_summary()
+
+    print(json.dumps(
+        weather_data,
+        indent=4
+    ))
+
+    # ---------------------------------------------------------
+    # CARE AGENT
+    # ---------------------------------------------------------
+
+    print("\n🤖 CARE AGENT")
+    print("Combining environment + weather...")
+
+    result = care_agent(
+        sensor_data,
+        weather_data
+    )
+
+    # ---------------------------------------------------------
+    # OUTPUT
+    # ---------------------------------------------------------
+
     print("\n🚨 URGENCY PAYLOAD")
+
     print(json.dumps(
         result["urgency"],
         indent=4
     ))
 
     print("\n🤖 CARE PAYLOAD")
+
     print(json.dumps(
         result["care"],
         indent=4
