@@ -96,9 +96,11 @@ import json
 
 from care_agent import care_agent
 from weather_agent import get_weather_summary
+from logging_config import logger
 
 
 def load_sensor_data():
+
     with open("sensor_data.json", "r") as file:
         return json.load(file)
 
@@ -108,35 +110,40 @@ def main():
     print("\n🌱 GREENPULSE AI BACKEND")
     print("=" * 60)
 
-    # ---------------------------------------------------------
-    # SENSOR
-    # ---------------------------------------------------------
+    # =========================================================
+    # SENSOR INPUT
+    # =========================================================
 
     sensor_data = load_sensor_data()
 
     print("\n📥 SENSOR INPUT")
-    print(json.dumps(
-        sensor_data,
-        indent=4
-    ))
 
-    # ---------------------------------------------------------
+    print(
+        json.dumps(
+            sensor_data,
+            indent=4
+        )
+    )
+
+    # =========================================================
     # WEATHER AGENT
-    # ---------------------------------------------------------
+    # =========================================================
 
     print("\n🌦️ WEATHER AGENT")
     print("Fetching live weather...")
 
     weather_data = get_weather_summary()
 
-    print(json.dumps(
-        weather_data,
-        indent=4
-    ))
+    print(
+        json.dumps(
+            weather_data,
+            indent=4
+        )
+    )
 
-    # ---------------------------------------------------------
-    # CARE AGENT
-    # ---------------------------------------------------------
+    # =========================================================
+    # CARE + DECISION AGENTS
+    # =========================================================
 
     print("\n🤖 CARE AGENT")
     print("Combining environment + weather...")
@@ -146,25 +153,46 @@ def main():
         weather_data
     )
 
-    # ---------------------------------------------------------
-    # OUTPUT
-    # ---------------------------------------------------------
+    # =========================================================
+    # DECISION
+    # =========================================================
 
-    print("\n🚨 URGENCY PAYLOAD")
+    print("\n🧠 DECISION RESOLVER")
 
-    print(json.dumps(
-        result["urgency"],
-        indent=4
-    ))
+    print(
+        json.dumps(
+            result["decision"],
+            indent=4
+        )
+    )
 
-    print("\n🤖 CARE PAYLOAD")
+    # =========================================================
+    # URGENCY
+    # =========================================================
 
-    print(json.dumps(
-        result["care"],
-        indent=4
-    ))
+    print("\n🚨 FINAL URGENCY PAYLOAD")
 
-    print("=" * 60)
+    print(
+        json.dumps(
+            result["urgency"],
+            indent=4
+        )
+    )
+
+    # =========================================================
+    # CARE
+    # =========================================================
+
+    print("\n🤖 FINAL CARE PAYLOAD")
+
+    print(
+        json.dumps(
+            result["care"],
+            indent=4
+        )
+    )
+
+    print("\n" + "=" * 60)
 
 
 if __name__ == "__main__":

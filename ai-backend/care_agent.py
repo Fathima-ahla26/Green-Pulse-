@@ -3,386 +3,616 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
+
+from decision_agent import resolve_decision
+from gmail_agent import get_inbox_summary
+
 
 load_dotenv()
 
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.5-flash"
+)
+
+
+# ============================================================
+# STRUCTURED GEMINI OUTPUT
+# ============================================================
+
 class CareAIOutput(BaseModel):
+
     quote: str = Field(
-        description="A short, memorable plant-care quote."
+        description=(
+            "A short creative literature-style quote that "
+            "is specifically inspired by the named plant "
+            "and its current environmental condition."
+        )
     )
+
     care_tip: str = Field(
-        description="A practical 1-3 sentence recommendation."
+        description=(
+            "Practical, plant-specific care advice based "
+            "on sensor readings, weather, environmental "
+            "decision and relevant gardening emails."
+        )
     )
 
 
-def create_gemini_model():
-    api_key = os.getenv("GEMINI_API_KEY")
+# ============================================================
+# GEMINI MODEL
+# ============================================================
 
-    if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY is missing from the .env file."
+def create_model():
+
+    if not GEMINI_API_KEY:
+
+        raise ValueError(
+            "GEMINI_API_KEY is missing from .env"
         )
 
-    model_name = os.getenv(
-        "GEMINI_MODEL",
-        "gemini-3.6-flash"
+    return ChatGoogleGenerativeAI(
+        model=GEMINI_MODEL,
+        google_api_key=GEMINI_API_KEY,
+        temperature=0.4
     )
 
-    model = ChatGoogleGenerativeAI(
-        model=model_name,
-        max_retries=2
-    )
 
-    return model
+# ============================================================
+# SENSOR DATA NORMALIZATION
+# ============================================================
 
-
-def normalize_sensor_data(sensor_data):
+def normalize_sensor_data(sensor_data: dict) -> dict:
     """
     Supports both:
-    1. GreenPulse MQTT telemetry format
-    2. Local test sensor_data.json format
+
+    1. Real MQTT telemetry contract
+    2. Earlier local mock sensor format
     """
 
-    if "readings" in sensor_data:
+    readings = sensor_data.get(
+        "readings",
+        {}
+    )
 
-        readings = sensor_data["readings"]
+    plant = sensor_data.get(
+        "plant",
+        "Unknown plant"
+    )
+
+    if readings:
 
         return {
             "device_id": sensor_data.get(
                 "device_id",
                 "greenpulse-01"
             ),
-            "seq": sensor_data.get("seq"),
-            "ts": sensor_data.get("ts"),
-            "plant": sensor_data.get(
-                "plant",
-                "Unknown"
+
+            "plant": plant,
+
+            "seq": sensor_data.get(
+                "seq"
             ),
-            "soil_moisture": readings.get(
+
+            "ts": sensor_data.get(
+                "ts"
+            ),
+
+            "soil_moisture_pct": readings.get(
                 "soil_moisture_pct"
             ),
+
             "soil_raw": readings.get(
                 "soil_raw"
             ),
-            "temperature": readings.get(
+
+            "temperature_c": readings.get(
                 "temperature_c"
             ),
-            "humidity": readings.get(
+
+            "humidity_pct": readings.get(
                 "humidity_pct"
             )
         }
+
+    # --------------------------------------------------------
+    # Backward compatibility with sensor_data.json
+    # --------------------------------------------------------
 
     return {
         "device_id": sensor_data.get(
             "device_id",
             "greenpulse-01"
         ),
-        "seq": sensor_data.get("seq"),
-        "ts": sensor_data.get("ts"),
-        "plant": sensor_data.get(
-            "plant",
-            "Unknown"
+
+        "plant": plant,
+
+        "seq": sensor_data.get(
+            "seq"
         ),
-        "soil_moisture": sensor_data.get(
+
+        "ts": sensor_data.get(
+            "ts"
+        ),
+
+        "soil_moisture_pct": sensor_data.get(
             "soil_moisture"
         ),
+
         "soil_raw": sensor_data.get(
             "soil_raw"
         ),
-        "temperature": sensor_data.get(
+
+        "temperature_c": sensor_data.get(
             "temperature"
         ),
-        "humidity": sensor_data.get(
+
+        "humidity_pct": sensor_data.get(
             "humidity"
         )
     }
 
 
-def calculate_urgency(soil_moisture):
+# ============================================================
+# TIMESTAMP
+# ============================================================
+
+def get_timestamp(sensor_data: dict) -> str:
     """
-    Initial environment-based urgency.
-
-    Weather is considered later by the AI care decision.
+    Use the device timestamp when available.
+    Otherwise generate a UTC timestamp.
     """
 
-    if soil_moisture is None:
-        return {
-            "level": "amber",
-            "score": 0.5,
-            "next_water_eta_hours": None
-        }
+    ts = sensor_data.get("ts")
 
-    if soil_moisture < 20:
+    if ts:
+        return ts
 
-        return {
-            "level": "red",
-            "score": 0.90,
-            "next_water_eta_hours": 2.0
-        }
-
-    elif soil_moisture < 35:
-
-        return {
-            "level": "amber",
-            "score": 0.62,
-            "next_water_eta_hours": 12.0
-        }
-
-    else:
-
-        return {
-            "level": "green",
-            "score": 0.20,
-            "next_water_eta_hours": None
-        }
-
-
-def care_agent(sensor_data, weather_data=None):
-
-    data = normalize_sensor_data(sensor_data)
-
-    plant = data["plant"]
-    soil_moisture = data["soil_moisture"]
-    temperature = data["temperature"]
-    humidity = data["humidity"]
-
-    if soil_moisture is None:
-        raise ValueError(
-            "soil_moisture_pct is missing from the sensor reading."
-        )
-
-    urgency = calculate_urgency(
-        soil_moisture
+    return (
+        datetime.now(timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
     )
 
-    # ---------------------------------------------------------
-    # WEATHER INFORMATION
-    # ---------------------------------------------------------
 
-    if weather_data:
+# ============================================================
+# WEATHER SUMMARY BUILDER
+# ============================================================
 
-        weather_location = weather_data.get(
-            "location",
-            "Unknown"
-        )
+def build_rich_weather_summary(
+    weather_data: dict
+) -> str:
+    """
+    Convert the structured weather-agent output into a
+    concise, context-rich summary suitable for the MQTT
+    care payload and Node-RED dashboard.
+    """
 
-        weather_temperature = weather_data.get(
-            "temperature_c"
-        )
+    location = weather_data.get(
+        "location",
+        "Plant location"
+    )
 
-        weather_humidity = weather_data.get(
-            "humidity_pct"
-        )
+    temperature = weather_data.get(
+        "temperature_c"
+    )
 
-        weather_condition = weather_data.get(
-            "weather_condition",
-            "Unknown"
-        )
+    humidity = weather_data.get(
+        "humidity_pct"
+    )
 
-        rain_probability = weather_data.get(
-            "max_rain_probability_pct"
-        )
+    condition = weather_data.get(
+        "weather_condition",
+        "Weather information unavailable"
+    )
 
-        next_12h_rain = weather_data.get(
-            "next_12h_rain_mm"
-        )
+    rain_probability = weather_data.get(
+        "max_rain_probability_pct"
+    )
 
-        rain_expected = weather_data.get(
-            "rain_expected",
-            False
-        )
+    next_12h_rain = weather_data.get(
+        "next_12h_rain_mm"
+    )
 
-        weather_summary = weather_data.get(
-            "summary",
-            ""
-        )
+    current_rain = weather_data.get(
+        "current_rain_mm"
+    )
 
-    else:
+    # --------------------------------------------------------
+    # Build readable values
+    # --------------------------------------------------------
 
-        weather_location = "Unknown"
-        weather_temperature = None
-        weather_humidity = None
-        weather_condition = "Unknown"
-        rain_probability = None
-        next_12h_rain = None
-        rain_expected = False
-        weather_summary = ""
+    temperature_text = (
+        f"{temperature:.1f}°C"
+        if isinstance(temperature, (int, float))
+        else "unavailable"
+    )
 
-    # ---------------------------------------------------------
-    # AI PROMPT
-    # ---------------------------------------------------------
+    humidity_text = (
+        f"{humidity:.0f}%"
+        if isinstance(humidity, (int, float))
+        else "unavailable"
+    )
 
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                """
-You are the GreenPulse plant-care AI.
+    probability_text = (
+        f"{rain_probability:.0f}%"
+        if isinstance(rain_probability, (int, float))
+        else "unavailable"
+    )
 
-You receive information from multiple agents:
+    rain_text = (
+        f"{next_12h_rain:.1f} mm"
+        if isinstance(next_12h_rain, (int, float))
+        else "unavailable"
+    )
 
-1. ENVIRONMENT AGENT
-   - Soil moisture
-   - Temperature
-   - Humidity
+    current_rain_text = (
+        f"{current_rain:.1f} mm"
+        if isinstance(current_rain, (int, float))
+        else "unavailable"
+    )
 
-2. WEATHER AGENT
-   - Current weather
-   - Rain probability
-   - Expected rainfall
+    return (
+        f"{location}: {condition}, "
+        f"{temperature_text} and {humidity_text} humidity. "
+        f"Current rain is {current_rain_text}. "
+        f"Rain probability over the forecast period is "
+        f"{probability_text}, with approximately "
+        f"{rain_text} expected in the next 12 hours."
+    )
 
-Your job is to combine these sources and produce
-one practical plant-care recommendation.
 
-IMPORTANT DECISION RULES:
+# ============================================================
+# CARE AGENT
+# ============================================================
 
-1. Soil moisture is the primary indicator of whether
-   the plant currently needs water.
+def generate_care_response(
+    sensor_data: dict,
+    weather_data: dict
+) -> dict:
 
-2. Weather is supporting information.
+    normalized = normalize_sensor_data(
+        sensor_data
+    )
 
-3. If the soil is very dry but significant rain is
-   expected soon, consider whether immediate watering
-   can be reduced or delayed.
+    # --------------------------------------------------------
+    # 1. Environmental decision
+    # --------------------------------------------------------
 
-4. If the soil is very dry and no significant rain
-   is expected, clearly recommend watering.
+    decision = resolve_decision(
+        sensor_data,
+        weather_data
+    )
 
-5. If soil moisture is healthy and rain is expected,
-   do not recommend unnecessary watering.
+    # --------------------------------------------------------
+    # 2. Gmail Inbox Agent
+    # --------------------------------------------------------
 
-6. Do not invent weather information.
+    print("\n📧 Calling Inbox Agent...")
 
-7. Do not invent email information.
+    inbox_summary = get_inbox_summary()
 
-8. Use only the supplied sensor and weather data.
+    print(
+        f"📨 Inbox information: {inbox_summary}"
+    )
 
-9. Give practical and conservative advice.
+    # --------------------------------------------------------
+    # 3. Rich weather summary
+    # --------------------------------------------------------
 
-10. Do not diagnose plant diseases.
+    weather_summary = build_rich_weather_summary(
+        weather_data
+    )
 
-11. Return only the requested structured fields.
+    print(
+        f"🌦️ Weather summary: {weather_summary}"
+    )
 
-12. The quote should be short and memorable.
+    # --------------------------------------------------------
+    # 4. Gemini prompt
+    # --------------------------------------------------------
 
-13. The care tip should be 1-3 sentences.
+    prompt = f"""
+You are the GreenPulse Care Agent.
 
-This is a multi-agent decision system.
-The final recommendation must consider BOTH
-environment data and weather data.
-"""
-            ),
-            (
-                "human",
-                """
-PLANT INFORMATION
-Plant: {plant}
+GreenPulse is an intelligent IoT plant-care system.
 
-ENVIRONMENT AGENT
-Soil moisture: {soil_moisture}%
-Temperature: {temperature}°C
-Humidity: {humidity}%
+Your task is to generate:
 
-WEATHER AGENT
-Location: {weather_location}
-Weather: {weather_condition}
-Weather temperature: {weather_temperature}°C
-Weather humidity: {weather_humidity}%
-Maximum rain probability: {rain_probability}%
-Expected rain in next 12 hours: {next_12h_rain} mm
-Rain expected: {rain_expected}
+1. A short, creative, literature-style quote inspired
+   specifically by the named plant and its current
+   environmental condition.
 
-Weather summary:
+2. Practical, context-aware, plant-specific care advice.
+
+--------------------------------------------------
+IMPORTANT REQUIREMENTS
+--------------------------------------------------
+
+PLANT-SPECIFIC GENERATION:
+
+The plant name is:
+
+{normalized["plant"]}
+
+Use this plant identity naturally in the advice
+when appropriate.
+
+The quote should be inspired by the actual plant,
+its current condition, and the surrounding environment.
+
+Do not produce a generic quote that could apply to
+any plant.
+
+The care tip should also refer to the plant specifically
+when useful.
+
+--------------------------------------------------
+ENVIRONMENTAL REASONING
+--------------------------------------------------
+
+Respect the final environmental decision.
+
+Do NOT contradict the final urgency decision.
+
+Soil moisture is the primary indicator of whether
+watering may be needed.
+
+Weather is supporting information.
+
+If soil is dry but significant rain is expected,
+do not blindly recommend heavy watering.
+
+If a gardening email recommends watering but weather
+indicates substantial imminent rainfall, explain the
+situation and follow the environmental decision.
+
+Do not invent weather information.
+
+Do not invent email information.
+
+Do not diagnose diseases.
+
+Do not make unsupported claims about plant health.
+
+--------------------------------------------------
+QUOTE REQUIREMENTS
+--------------------------------------------------
+
+Create a short literary-style quote.
+
+The quote should:
+
+- relate to the named plant
+- reflect its current environmental condition
+- be creative but natural
+- avoid clichés
+- normally be one sentence
+
+--------------------------------------------------
+CARE TIP REQUIREMENTS
+--------------------------------------------------
+
+Create practical advice based on:
+
+- plant identity
+- soil moisture
+- temperature
+- humidity
+- weather
+- rainfall forecast
+- relevant gardening email information
+- final watering decision
+
+Keep it concise, normally 1-3 sentences.
+
+--------------------------------------------------
+PLANT
+--------------------------------------------------
+
+Plant:
+{normalized["plant"]}
+
+--------------------------------------------------
+SENSOR DATA
+--------------------------------------------------
+
+Device:
+{normalized["device_id"]}
+
+Soil moisture:
+{normalized["soil_moisture_pct"]} %
+
+Raw soil reading:
+{normalized["soil_raw"]}
+
+Temperature:
+{normalized["temperature_c"]} °C
+
+Humidity:
+{normalized["humidity_pct"]} %
+
+--------------------------------------------------
+FINAL ENVIRONMENTAL DECISION
+--------------------------------------------------
+
+Urgency:
+{decision["level"]}
+
+Score:
+{decision["score"]}
+
+Next watering ETA:
+{decision["next_water_eta_hours"]} hours
+
+Reason:
+{decision["reason"]}
+
+--------------------------------------------------
+WEATHER INFORMATION
+--------------------------------------------------
+
 {weather_summary}
 
-Generate the final GreenPulse plant-care recommendation.
-"""
-            )
-        ]
-    )
+--------------------------------------------------
+GARDENING / NOTIFICATION INFORMATION
+--------------------------------------------------
 
-    model = create_gemini_model()
+{inbox_summary}
+
+--------------------------------------------------
+FINAL INSTRUCTION
+--------------------------------------------------
+
+Generate ONLY the structured fields:
+
+quote
+care_tip
+"""
+
+    # --------------------------------------------------------
+    # 5. Gemini
+    # --------------------------------------------------------
+
+    model = create_model()
 
     structured_model = model.with_structured_output(
         CareAIOutput,
         method="json_schema"
     )
 
-    chain = prompt | structured_model
-
-    result = chain.invoke(
-        {
-            "plant": plant,
-            "soil_moisture": soil_moisture,
-            "temperature": temperature,
-            "humidity": humidity,
-            "weather_location": weather_location,
-            "weather_condition": weather_condition,
-            "weather_temperature": weather_temperature,
-            "weather_humidity": weather_humidity,
-            "rain_probability": rain_probability,
-            "next_12h_rain": next_12h_rain,
-            "rain_expected": rain_expected,
-            "weather_summary": weather_summary
-        }
+    result = structured_model.invoke(
+        prompt
     )
 
-    # ---------------------------------------------------------
-    # TIMESTAMP
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # 6. Timestamp
+    # --------------------------------------------------------
 
-    timestamp = data["ts"]
+    timestamp = get_timestamp(
+        sensor_data
+    )
 
-    if not timestamp:
-
-        timestamp = (
-            datetime.now(timezone.utc)
-            .isoformat()
-            .replace("+00:00", "Z")
-        )
-
-    # ---------------------------------------------------------
-    # CARE MQTT PAYLOAD
-    # ---------------------------------------------------------
-
-    care_payload = {
-        "device_id": data["device_id"],
-        "ts": timestamp,
-        "in_reply_to": data["seq"],
-        "quote": result.quote,
-        "care_tip": result.care_tip,
-        "weather_summary": weather_summary,
-        "inbox_summary": "",
-        "agents": [
-            "environment",
-            "weather"
-        ],
-        "model": os.getenv(
-            "GEMINI_MODEL",
-            "gemini-3.6-flash"
-        )
-    }
-
-    # ---------------------------------------------------------
-    # URGENCY MQTT PAYLOAD
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # 7. MQTT urgency payload
+    # --------------------------------------------------------
 
     urgency_payload = {
-        "device_id": data["device_id"],
+        "device_id": normalized["device_id"],
         "ts": timestamp,
-        "in_reply_to": data["seq"],
-        "level": urgency["level"],
-        "score": urgency["score"],
-        "next_water_eta_hours": (
-            urgency["next_water_eta_hours"]
-        )
+        "in_reply_to": normalized["seq"],
+        "level": decision["level"],
+        "score": decision["score"],
+        "next_water_eta_hours": decision[
+            "next_water_eta_hours"
+        ]
+    }
+
+    # --------------------------------------------------------
+    # 8. MQTT care payload
+    # --------------------------------------------------------
+
+    care_payload = {
+        "device_id": normalized["device_id"],
+        "ts": timestamp,
+        "in_reply_to": normalized["seq"],
+        "quote": result.quote.strip(),
+        "care_tip": result.care_tip.strip(),
+        "weather_summary": weather_summary,
+        "inbox_summary": inbox_summary,
+        "agents": [
+            "environment",
+            "weather",
+            "inbox"
+        ],
+        "model": GEMINI_MODEL
     }
 
     return {
+        "decision": decision,
         "urgency": urgency_payload,
         "care": care_payload
     }
+
+
+# ============================================================
+# PUBLIC FUNCTION USED BY MQTT BACKEND
+# ============================================================
+
+def care_agent(
+    sensor_data: dict,
+    weather_data: dict
+) -> dict:
+
+    return generate_care_response(
+        sensor_data,
+        weather_data
+    )
+
+
+# ============================================================
+# LOCAL TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    print("\n🌱 GREENPULSE CARE AGENT")
+    print("=" * 50)
+
+    test_sensor = {
+        "device_id": "greenpulse-01",
+        "plant": "Tomato",
+        "seq": 1482,
+        "ts": (
+            datetime.now(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        ),
+        "readings": {
+            "soil_moisture_pct": 18,
+            "soil_raw": 2210,
+            "temperature_c": 31.5,
+            "humidity_pct": 55
+        }
+    }
+
+    test_weather = {
+        "location": "Malabe",
+        "temperature_c": 25.1,
+        "humidity_pct": 97,
+        "current_rain_mm": 0.1,
+        "current_precipitation_mm": 0.1,
+        "weather_condition": "Light drizzle",
+        "max_rain_probability_pct": 100,
+        "next_12h_rain_mm": 5.2,
+        "next_12h_precipitation_mm": 7.2,
+        "rain_expected": True,
+        "summary": (
+            "Malabe: Light drizzle, 25.1°C and 97% humidity. "
+            "Rain is expected within the next several hours."
+        )
+    }
+
+    result = care_agent(
+        test_sensor,
+        test_weather
+    )
+
+    print("\n🧠 DECISION:")
+    print(result["decision"])
+
+    print("\n🚨 FINAL URGENCY PAYLOAD:")
+    print(result["urgency"])
+
+    print("\n🤖 FINAL CARE PAYLOAD:")
+    print(result["care"])
+
+    print("\n" + "=" * 60)
